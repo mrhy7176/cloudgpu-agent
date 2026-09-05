@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,7 +18,8 @@ import (
 // surface. Two implementations: Docker (real) and Mock (control-plane only).
 type Handler interface {
 	Reserve(gpuIndex int) (claimID string, err error)
-	Run(claimID, image string, ports []int, env map[string]string, keepAliveMinutes int) (serviceURL string, err error)
+	// command / args 覆盖镜像默认 ENTRYPOINT/CMD；为空则用镜像自带的。
+	Run(claimID, image string, command string, args []string, ports []int, env map[string]string, keepAliveMinutes int) (serviceURL string, err error)
 	Release(claimID string) error
 }
 
@@ -40,7 +42,8 @@ func (m *mockHandler) Reserve(gpuIndex int) (string, error) {
 	return id, nil
 }
 
-func (m *mockHandler) Run(claimID, image string, ports []int, env map[string]string, keep int) (string, error) {
+// mock 模式忽略 command / args。
+func (m *mockHandler) Run(claimID, image string, _ string, _ []string, ports []int, env map[string]string, keep int) (string, error) {
 	url := fmt.Sprintf("https://i-%s.i.cloudgpu.app", claimID)
 	log.Printf("[runtime/mock] run claim=%s image=%s ports=%v env=%d keys keep=%dm -> %s",
 		claimID, image, ports, len(env), keep, url)
@@ -72,8 +75,8 @@ type dockerHandler struct {
 // spawn and returns a nil service URL — the control plane fills in a
 // fallback URL (which will 502 until the tunnel is live).
 var (
-	frpsServer     = os.Getenv("FRPS_SERVER")      // e.g. "frps.cloudgpu.app:7000"
-	frpsToken      = os.Getenv("FRPS_TOKEN")       // shared secret
+	frpsServer     = os.Getenv("FRPS_SERVER")         // e.g. "frps.cloudgpu.app:7000"
+	frpsToken      = os.Getenv("FRPS_TOKEN")          // shared secret
 	frpsSubdomain  = os.Getenv("FRPS_SUBDOMAIN_HOST") // e.g. "i.cloudgpu.app"
 	frpcBinaryPath = firstExisting("/usr/local/bin/frpc", "/opt/frp/frpc", "/usr/bin/frpc")
 )
@@ -145,7 +148,7 @@ func (d *dockerHandler) Reserve(gpuIndex int) (string, error) {
 	return id, nil
 }
 
-func (d *dockerHandler) Run(claimID, image string, ports []int, env map[string]string, keepAliveMinutes int) (string, error) {
+func (d *dockerHandler) Run(claimID, image string, command string, cmdArgs []string, ports []int, env map[string]string, keepAliveMinutes int) (string, error) {
 	d.mu.Lock()
 	cl, ok := d.claims[claimID]
 	d.mu.Unlock()
@@ -167,6 +170,12 @@ func (d *dockerHandler) Run(claimID, image string, ports []int, env map[string]s
 		args = append(args, "-e", k+"="+v)
 	}
 	args = append(args, image)
+	// 镜像名之后紧跟 command + args，即 `docker run ... <image> <command> <args...>`，
+	// 覆盖镜像默认 CMD。command 为空时不追加，让镜像自己的 ENTRYPOINT/CMD 生效。
+	if command != "" {
+		args = append(args, command)
+	}
+	args = append(args, cmdArgs...)
 	log.Printf("[runtime/docker] %s", strings.Join(append([]string{"docker"}, args...), " "))
 	cmd := exec.Command("docker", args...)
 	out, err := cmd.CombinedOutput()
@@ -248,7 +257,7 @@ type = http
 local_ip = 127.0.0.1
 local_port = %d
 subdomain = %s
-`, strings.TrimSuffix(frpsServer, ":7000")+":7000",
+`, frpsServerAddr(frpsServer),
 		frpsToken, claimID, hostPort, claimID)
 
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0600); err != nil {
@@ -269,6 +278,16 @@ subdomain = %s
 	url := fmt.Sprintf("https://%s.%s/", claimID, host)
 	log.Printf("[runtime/docker] frpc tunnel up: %s -> localhost:%d", url, hostPort)
 	return url, nil
+}
+
+// frpsServerAddr 给没带端口的 FRPS_SERVER 补上默认 :7000。
+// 以前是 TrimSuffix(":7000")+":7000"，"host:7001" 会变成 "host:7001:7000"。
+// 用 net.SplitHostPort 判断：能拆出端口就原样返回（含 [::1]:7000 这种 IPv6 写法）。
+func frpsServerAddr(server string) string {
+	if _, _, err := net.SplitHostPort(server); err == nil {
+		return server
+	}
+	return server + ":7000"
 }
 
 // unused helper to keep encoding/json imported in case we expand run_ack

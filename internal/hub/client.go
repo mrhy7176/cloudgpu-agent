@@ -22,7 +22,9 @@ import (
 // Returning an error lets the client log and, optionally, send a nack.
 type Handler interface {
 	OnReserve(reqID string, gpuIndex int) (claimID string, err error)
-	OnDockerRun(reqID, claimID, image string, ports []int, env map[string]string, keepAlive int) (serviceURL string, err error)
+	// command / args 是模板对镜像默认 ENTRYPOINT/CMD 的覆盖（hub 侧
+	// P2PAgentAdapter.createInstance 下发），可以为空。
+	OnDockerRun(reqID, claimID, image string, command string, args []string, ports []int, env map[string]string, keepAlive int) (serviceURL string, err error)
 	OnRelease(claimID string) error
 }
 
@@ -214,13 +216,17 @@ func (c *Client) dispatch(raw []byte) {
 	case "docker_run":
 		claimID, _ := generic["claim_id"].(string)
 		image, _ := generic["image"].(string)
+		// hub 会带 command(string) + args([]string)，以前直接被丢掉了，
+		// 结果模板自定义的启动命令在 P2P 卡上根本没生效。
+		command, _ := generic["command"].(string)
+		args := toStringList(generic["args"])
 		ports := toIntList(generic["ports"])
 		env := toStringMap(generic["env"])
 		keepAlive := 60
 		if v, ok := generic["keep_alive_minutes"].(float64); ok {
 			keepAlive = int(v)
 		}
-		url, err := c.handler.OnDockerRun(reqID, claimID, image, ports, env, keepAlive)
+		url, err := c.handler.OnDockerRun(reqID, claimID, image, command, args, ports, env, keepAlive)
 		ack := map[string]interface{}{
 			"type":     "run_ack",
 			"req_id":   reqID,
@@ -238,8 +244,13 @@ func (c *Client) dispatch(raw []byte) {
 	case "release":
 		claimID, _ := generic["claim_id"].(string)
 		err := c.handler.OnRelease(claimID)
+		// req_id 必须回传：hub 靠它把应答和请求对上（pendingReplies）。
+		// 不回传的话每一次释放都会干等到 30 秒超时，而 hub 那边照样
+		// 报「销毁成功」—— 供给方的卡槽还占着，我们以为它空了。
+		// reserve_ack / run_ack 一直是回传的，只有这一条漏了。
 		_ = c.sendJSON(map[string]interface{}{
 			"type":     "release_ack",
+			"req_id":   reqID,
 			"claim_id": claimID,
 			"agent_id": c.agentID,
 			"ok":       err == nil,
@@ -279,6 +290,24 @@ func toIntList(v interface{}) []int {
 	for _, x := range list {
 		if f, ok := x.(float64); ok {
 			out = append(out, int(f))
+		}
+	}
+	return out
+}
+
+// toStringList 把 JSON 数组转成 []string，非字符串元素跳过。
+func toStringList(v interface{}) []string {
+	if v == nil {
+		return nil
+	}
+	list, ok := v.([]interface{})
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(list))
+	for _, x := range list {
+		if s, ok := x.(string); ok {
+			out = append(out, s)
 		}
 	}
 	return out

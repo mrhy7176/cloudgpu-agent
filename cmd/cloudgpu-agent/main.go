@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/mrhy7176/cloudgpu-agent/internal/config"
 	"github.com/mrhy7176/cloudgpu-agent/internal/hub"
@@ -24,8 +26,8 @@ func (a *agentHandler) OnReserve(reqID string, gpuIndex int) (string, error) {
 	return a.rt.Reserve(gpuIndex)
 }
 
-func (a *agentHandler) OnDockerRun(reqID, claimID, image string, ports []int, env map[string]string, keepAlive int) (string, error) {
-	return a.rt.Run(claimID, image, ports, env, keepAlive)
+func (a *agentHandler) OnDockerRun(reqID, claimID, image string, command string, args []string, ports []int, env map[string]string, keepAlive int) (string, error) {
+	return a.rt.Run(claimID, image, command, args, ports, env, keepAlive)
 }
 
 func (a *agentHandler) OnRelease(claimID string) error {
@@ -43,6 +45,19 @@ func main() {
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
 		log.Fatalf("config load failed: %v", err)
+	}
+	// agent_id 为空时只生成一次并写回配置文件。以前 Save() 从没被调用过，
+	// 每次重启都换一个新 id：hub 侧多一行 p2p_agent，lease 表还指着旧的死 id。
+	// 写回失败只告警不退出 —— 本次进程内的 id 仍然一致，下次重启再试。
+	// 必须在应用 --runtime 覆盖之前写，否则命令行临时指定的 mock 会被固化进文件。
+	if cfg.AgentID == "" {
+		host, _ := os.Hostname()
+		cfg.AgentID = fmt.Sprintf("agent-%s-%d", host, time.Now().UnixNano())
+		if err := config.Save(*cfgPath, cfg); err != nil {
+			log.Printf("WARN: could not persist generated agent_id to %s: %v (id will change on next restart)", *cfgPath, err)
+		} else {
+			log.Printf("generated agent_id=%s and saved to %s", cfg.AgentID, *cfgPath)
+		}
 	}
 	if *runtimeOverride != "" {
 		cfg.Runtime = *runtimeOverride

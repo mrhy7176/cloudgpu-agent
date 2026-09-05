@@ -18,6 +18,12 @@ type Device struct {
 	FreeVRAM  int    `json:"free_vram_gb"`
 	Util      int    `json:"utilization_pct"`
 	Processes int    `json:"compute_processes"`
+	// ProcNames 是 GPU 上计算进程的名字。
+	//
+	// 服务端 P2pWatchService 的违规判定认的是名字（xmrig / ethminer / hashcat …），
+	// 只有 pid 判不了任何事。采名字不采内容 —— 这条界线和条款一致：
+	// 在租来的机器上管行为，不管客户生成了什么。
+	ProcNames []string `json:"compute_process_names,omitempty"`
 	// Busy is our own composite verdict: utilization < 5% AND no processes
 	// AND no "other platform" containers using this device.
 	Busy bool `json:"busy"`
@@ -67,21 +73,34 @@ func Scan() ([]Device, error) {
 	// Now count compute processes per GPU via a second nvidia-smi call.
 	// This is the "is anyone else using this" signal that makes coexistence
 	// with other rental platforms possible.
+	// 连名字一起取。原来只取了 gpu_uuid,pid —— 而服务端的违规判定
+	// 认的是名字，有 pid 没名字等于采了个用不上的东西。
 	procOut, err := exec.Command("nvidia-smi",
-		"--query-compute-apps=gpu_uuid,pid",
+		"--query-compute-apps=gpu_uuid,pid,process_name",
 		"--format=csv,noheader,nounits",
 	).Output()
 	if err == nil {
 		procByUUID := map[string]int{}
+		namesByUUID := map[string][]string{}
 		ps := bufio.NewScanner(bytes.NewReader(procOut))
 		for ps.Scan() {
 			f := strings.Split(ps.Text(), ",")
-			if len(f) >= 1 {
-				procByUUID[strings.TrimSpace(f[0])]++
+			if len(f) < 1 {
+				continue
+			}
+			uuid := strings.TrimSpace(f[0])
+			procByUUID[uuid]++
+			if len(f) >= 3 {
+				// process_name 本身可能含逗号，把第三列之后的重新拼回去
+				name := strings.TrimSpace(strings.Join(f[2:], ","))
+				if name != "" && len(namesByUUID[uuid]) < 16 {
+					namesByUUID[uuid] = append(namesByUUID[uuid], name)
+				}
 			}
 		}
 		for i := range devices {
 			devices[i].Processes = procByUUID[devices[i].UUID]
+			devices[i].ProcNames = namesByUUID[devices[i].UUID]
 		}
 	}
 
