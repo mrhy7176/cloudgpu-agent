@@ -355,4 +355,4 @@ func toStringMap(v interface{}) map[string]string {
 
 // AgentVersion is injected at build time via -ldflags -X. The default
 // placeholder value is used in development builds.
-var AgentVersion = "0.2.0"
+var AgentVersion = "0.2.1"

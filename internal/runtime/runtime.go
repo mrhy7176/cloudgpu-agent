@@ -232,6 +232,12 @@ func (d *dockerHandler) Run(spec RunSpec) (string, error) {
 	if spec.Image == "" {
 		return "", fmt.Errorf("docker_run without an image")
 	}
+	// 镜像还没拉完就立刻失败：hub 只等 5 分钟，几个 GB 的镜像在等的时间里拉不完，
+	// 原来 docker run 自己去拉，客户白等 5 分钟才看到超时。现在马上报错，后台接着拉，下一单就能用。
+	if !imagePresent(spec.Image) {
+		pullInBackground(spec.Image)
+		return "", fmt.Errorf("image %s is not on this machine yet (downloading in the background); try again later", spec.Image)
+	}
 	args := []string{
 		"run", "-d",
 		"--name", "cloudgpu-" + spec.ClaimID,
@@ -592,14 +598,17 @@ func (d *dockerHandler) Prefetch(images []string, frpcURLs []string, frpcSHA256 
 			if img == "" {
 				continue
 			}
-			if exec.Command("docker", "image", "inspect", img).Run() == nil {
+			if imagePresent(img) {
 				continue
 			}
 			log.Printf("[runtime/docker] prefetch: pulling %s", img)
 			start := time.Now()
-			out, err := exec.Command("docker", "pull", img).CombinedOutput()
+			started, err := pullTracked(img)
+			if !started {
+				continue
+			}
 			if err != nil {
-				log.Printf("[runtime/docker] prefetch %s failed: %v: %s", img, err, lastLine(string(out)))
+				log.Printf("[runtime/docker] prefetch %s failed: %v", img, err)
 				continue
 			}
 			log.Printf("[runtime/docker] prefetch %s done in %s", img, time.Since(start).Round(time.Second))
