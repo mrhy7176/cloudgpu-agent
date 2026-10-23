@@ -29,8 +29,8 @@ type Handler interface {
 	// CleanupOrphans 在 agent 启动时清掉上一个进程留下的容器：claim 只记在内存里，
 	// 进程一重启它们就没人管了，而 hub 那边早已按掉线把租约关掉。
 	CleanupOrphans()
-	// Prefetch 后台拉镜像，不阻塞调用方。第一单来时镜像已在本地，开机才赶得上超时。
-	Prefetch(images []string)
+	// Prefetch 后台装好 frpc、拉好镜像，不阻塞调用方。第一单来时都已在本地，开机才赶得上超时。
+	Prefetch(images []string, frpcURLs []string, frpcSHA256 string)
 }
 
 // RunSpec 是 hub 的 docker_run 消息。
@@ -97,7 +97,7 @@ func (m *mockHandler) Run(spec RunSpec) (string, error) {
 
 func (m *mockHandler) CleanupOrphans() {}
 
-func (m *mockHandler) Prefetch(images []string) {
+func (m *mockHandler) Prefetch(images []string, _ []string, _ string) {
 	log.Printf("[runtime/mock] prefetch %v (skipped)", images)
 }
 
@@ -526,13 +526,18 @@ func (d *dockerHandler) CleanupOrphans() {
 
 var prefetchMu sync.Mutex
 
-func (d *dockerHandler) Prefetch(images []string) {
+func (d *dockerHandler) Prefetch(images []string, frpcURLs []string, frpcSHA256 string) {
 	go func() {
 		// 一次只拉一轮：agent 断线重连会再收到一次 prefetch，别叠着拉。
 		if !prefetchMu.TryLock() {
 			return
 		}
 		defer prefetchMu.Unlock()
+		if len(frpcURLs) > 0 {
+			if _, err := ensureFrpc(frpcURLs, frpcSHA256); err != nil {
+				log.Printf("[runtime/docker] prefetch frpc failed (will retry on first rental): %v", err)
+			}
+		}
 		for _, img := range images {
 			if img == "" {
 				continue

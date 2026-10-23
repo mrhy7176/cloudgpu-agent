@@ -26,7 +26,7 @@ type Handler interface {
 	// spec 由 hub 侧 P2PAgentAdapter.createInstance 下发：镜像、启动参数、隧道。
 	OnDockerRun(reqID string, spec agentrt.RunSpec) (serviceURL string, err error)
 	OnRelease(claimID string) error
-	OnPrefetch(images []string)
+	OnPrefetch(images []string, frpcURLs []string, frpcSHA256 string)
 }
 
 // Client is a long-lived connection to the CloudGPU hub. It owns the socket,
@@ -276,7 +276,8 @@ func (c *Client) dispatch(raw []byte) {
 		})
 
 	case "prefetch":
-		c.handler.OnPrefetch(toStringList(generic["images"]))
+		sha, _ := generic["frpc_sha256"].(string)
+		c.handler.OnPrefetch(toStringList(generic["images"]), toStringList(generic["frpc_urls"]), sha)
 
 	case "ping":
 		_ = c.sendJSON(map[string]interface{}{"type": "pong", "agent_id": c.agentID})

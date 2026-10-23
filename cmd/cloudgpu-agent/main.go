@@ -34,8 +34,8 @@ func (a *agentHandler) OnRelease(claimID string) error {
 	return a.rt.Release(claimID)
 }
 
-func (a *agentHandler) OnPrefetch(images []string) {
-	a.rt.Prefetch(images)
+func (a *agentHandler) OnPrefetch(images []string, frpcURLs []string, frpcSHA256 string) {
+	a.rt.Prefetch(images, frpcURLs, frpcSHA256)
 }
 
 func main() {
