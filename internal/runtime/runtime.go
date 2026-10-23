@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -69,14 +70,25 @@ type Tunnel struct {
 // requested runtime mode.
 func NewHandler(mode string, cacheDir string) Handler {
 	if mode == "mock" {
-		return &mockHandler{}
+		return &mockHandler{tunnels: map[string]*mockTunnel{}}
 	}
 	return &dockerHandler{cacheDir: cacheDir, claims: make(map[string]*claim)}
 }
 
 // -------------------- Mock implementation --------------------
 
-type mockHandler struct{ mu sync.Mutex }
+// mockHandler 不碰 docker 和 nvidia-smi。hub 下发隧道时，它在本机起一个小网页并真的用 frpc 挂出去：
+// 这样「注册 → 派单 → 隧道 → 公网能打开 → 释放 → 结账」整条控制面可以在没有 GPU 的机器上实测。
+type mockHandler struct {
+	mu      sync.Mutex
+	tunnels map[string]*mockTunnel
+}
+
+type mockTunnel struct {
+	srv     *http.Server
+	frpc    *exec.Cmd
+	cfgPath string
+}
 
 func (m *mockHandler) Reserve(gpuIndex int) (string, error) {
 	id := fmt.Sprintf("mock-claim-%d-%d", gpuIndex, time.Now().UnixNano())
@@ -86,12 +98,28 @@ func (m *mockHandler) Reserve(gpuIndex int) (string, error) {
 
 // mock 模式不起容器也不起隧道，回一个隧道地址的样子，给控制面做联调。
 func (m *mockHandler) Run(spec RunSpec) (string, error) {
-	url := fmt.Sprintf("https://i-%s.i.cloudgpu.app", spec.ClaimID)
-	if spec.Tunnel != nil && spec.Tunnel.CustomDomain != "" {
-		url = "https://" + spec.Tunnel.CustomDomain
+	log.Printf("[runtime/mock] run claim=%s image=%s ports=%v env=%d keys",
+		spec.ClaimID, spec.Image, spec.Ports, len(spec.Env))
+	if spec.Tunnel == nil {
+		return fmt.Sprintf("https://i-%s.i.cloudgpu.app", spec.ClaimID), nil
 	}
-	log.Printf("[runtime/mock] run claim=%s image=%s ports=%v env=%d keys -> %s",
-		spec.ClaimID, spec.Image, spec.Ports, len(spec.Env), url)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return "", err
+	}
+	page := fmt.Sprintf("cloudgpu-agent mock: claim=%s image=%s\n", spec.ClaimID, spec.Image)
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, page)
+	})}
+	go func() { _ = srv.Serve(ln) }()
+	cmd, cfgPath, url, err := openTunnel(spec.Tunnel, ln.Addr().(*net.TCPAddr).Port)
+	m.mu.Lock()
+	m.tunnels[spec.ClaimID] = &mockTunnel{srv: srv, frpc: cmd, cfgPath: cfgPath}
+	m.mu.Unlock()
+	if err != nil {
+		_ = m.Release(spec.ClaimID)
+		return "", err
+	}
 	return url, nil
 }
 
@@ -102,6 +130,20 @@ func (m *mockHandler) Prefetch(images []string, _ []string, _ string) {
 }
 
 func (m *mockHandler) Release(claimID string) error {
+	m.mu.Lock()
+	t := m.tunnels[claimID]
+	delete(m.tunnels, claimID)
+	m.mu.Unlock()
+	if t != nil {
+		if t.frpc != nil && t.frpc.Process != nil {
+			_ = t.frpc.Process.Kill()
+			_, _ = t.frpc.Process.Wait()
+		}
+		if t.cfgPath != "" {
+			_ = os.Remove(t.cfgPath)
+		}
+		_ = t.srv.Close()
+	}
 	log.Printf("[runtime/mock] release claim=%s", claimID)
 	return nil
 }
@@ -275,12 +317,24 @@ func inspectHostPort(containerID string, containerPort int) int {
 // *exec.Cmd. Format matches the backend's ApiTunnelInstaller (TOML, TLS,
 // customDomains = <id>-i.cloudgpu.app).
 func (d *dockerHandler) startFrpcTunnel(cl *claim, t *Tunnel, hostPort int) (string, error) {
+	cmd, cfgPath, url, err := openTunnel(t, hostPort)
+	if cmd != nil {
+		d.mu.Lock()
+		cl.frpcCmd = cmd
+		cl.frpcCfgPath = cfgPath
+		d.mu.Unlock()
+	}
+	return url, err
+}
+
+// openTunnel 起 frpc 并等 frps 放行。返回的 cmd 非空时由调用方负责在释放时杀掉。
+func openTunnel(t *Tunnel, hostPort int) (*exec.Cmd, string, string, error) {
 	if t.ProxyName == "" || t.CustomDomain == "" || t.ServerAddr == "" {
-		return "", fmt.Errorf("incomplete tunnel spec")
+		return nil, "", "", fmt.Errorf("incomplete tunnel spec")
 	}
 	bin, err := ensureFrpc(t.FrpcURLs, t.FrpcSHA256)
 	if err != nil {
-		return "", err
+		return nil, "", "", err
 	}
 	cfgDir := "/var/run/cloudgpu-agent"
 	_ = os.MkdirAll(cfgDir, 0700)
@@ -311,19 +365,15 @@ localPort = %d
 customDomains = [%q]
 %s`, t.ServerAddr, port, t.Token, logPath, t.ProxyName, hostPort, t.CustomDomain, bw)
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0600); err != nil {
-		return "", fmt.Errorf("write frpc config: %w", err)
+		return nil, "", "", fmt.Errorf("write frpc config: %w", err)
 	}
 	_ = os.Remove(logPath)
 	cmd := exec.Command(bin, "-c", cfgPath)
 	// 供给方机器上常带着 http_proxy（国内机房尤其）：frpc 走代理连我们 IP 会断，必须直连。
 	cmd.Env = withoutProxy(os.Environ())
 	if err := cmd.Start(); err != nil {
-		return "", fmt.Errorf("spawn frpc: %w", err)
+		return nil, "", "", fmt.Errorf("spawn frpc: %w", err)
 	}
-	d.mu.Lock()
-	cl.frpcCmd = cmd
-	cl.frpcCfgPath = cfgPath
-	d.mu.Unlock()
 
 	// 等 frps 放行（日志里出现 start proxy success）。不等的话 hub 会把一个还没通的地址交给客户。
 	deadline := time.Now().Add(45 * time.Second)
@@ -333,15 +383,15 @@ customDomains = [%q]
 		text := string(b)
 		if strings.Contains(text, "start proxy success") {
 			url := "https://" + t.CustomDomain
-			log.Printf("[runtime/docker] tunnel up: %s -> localhost:%d", url, hostPort)
-			return url, nil
+			log.Printf("[runtime] tunnel up: %s -> localhost:%d", url, hostPort)
+			return cmd, cfgPath, url, nil
 		}
 		if strings.Contains(text, "start error") || strings.Contains(text, "reject") {
-			return "", fmt.Errorf("frps refused the tunnel: %s", lastLine(text))
+			return cmd, cfgPath, "", fmt.Errorf("frps refused the tunnel: %s", lastLine(text))
 		}
 	}
 	b, _ := os.ReadFile(logPath)
-	return "", fmt.Errorf("frpc did not connect within 45s: %s", lastLine(string(b)))
+	return cmd, cfgPath, "", fmt.Errorf("frpc did not connect within 45s: %s", lastLine(string(b)))
 }
 
 func lastLine(s string) string {
