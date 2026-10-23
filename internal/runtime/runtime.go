@@ -1,10 +1,15 @@
 package runtime
 
 import (
+	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,29 +17,78 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/mrhy7176/cloudgpu-agent/internal/gpu"
 )
 
 // Handler is the minimal "reserve a GPU, run a container, release it"
 // surface. Two implementations: Docker (real) and Mock (control-plane only).
 type Handler interface {
 	Reserve(gpuIndex int) (claimID string, err error)
-	// command / args 覆盖镜像默认 ENTRYPOINT/CMD；为空则用镜像自带的。
-	Run(claimID, image string, command string, args []string, ports []int, env map[string]string, keepAliveMinutes int) (serviceURL string, err error)
+	Run(spec RunSpec) (serviceURL string, err error)
 	Release(claimID string) error
+	// CleanupOrphans 在 agent 启动时清掉上一个进程留下的容器：claim 只记在内存里，
+	// 进程一重启它们就没人管了，而 hub 那边早已按掉线把租约关掉。
+	CleanupOrphans()
+	// Prefetch 后台装好 frpc、拉好镜像，不阻塞调用方。第一单来时都已在本地，开机才赶得上超时。
+	Prefetch(images []string, frpcURLs []string, frpcSHA256 string)
+}
+
+// RunSpec 是 hub 的 docker_run 消息。
+type RunSpec struct {
+	ClaimID string
+	Image   string
+	// Entrypoint 覆盖镜像的 ENTRYPOINT；空 = 用镜像自带的。
+	Entrypoint string
+	// User 以哪个用户起容器（docker run --user）；空 = 镜像默认。
+	User string
+	// Command / Args 覆盖镜像默认 CMD；为空则用镜像自带的。
+	Command          string
+	Args             []string
+	Ports            []int
+	Env              map[string]string
+	KeepAliveMinutes int
+	// Tunnel 非空时用 frpc 把 Tunnel.LocalPort 挂到 https://<CustomDomain>。
+	Tunnel *Tunnel
+}
+
+// Tunnel 由 hub 下发：每条租约一个登记过的 id，frps 插件只放行登记过的 id。
+// 以前 frps 地址和 token 要供给方自己写进环境变量，安装脚本一个都没写，结果没有一台机器起过隧道。
+type Tunnel struct {
+	ProxyName    string   `json:"proxy_name"`
+	CustomDomain string   `json:"custom_domain"`
+	ServerAddr   string   `json:"server_addr"`
+	ServerPort   int      `json:"server_port"`
+	Token        string   `json:"token"`
+	LocalPort    int      `json:"local_port"`
+	Bandwidth    string   `json:"bandwidth"`
+	FrpcURLs     []string `json:"frpc_urls"`
+	FrpcSHA256   string   `json:"frpc_sha256"`
 }
 
 // NewHandler returns either a Docker or Mock implementation based on the
 // requested runtime mode.
 func NewHandler(mode string, cacheDir string) Handler {
 	if mode == "mock" {
-		return &mockHandler{}
+		return &mockHandler{tunnels: map[string]*mockTunnel{}}
 	}
 	return &dockerHandler{cacheDir: cacheDir, claims: make(map[string]*claim)}
 }
 
 // -------------------- Mock implementation --------------------
 
-type mockHandler struct{ mu sync.Mutex }
+// mockHandler 不碰 docker 和 nvidia-smi。hub 下发隧道时，它在本机起一个小网页并真的用 frpc 挂出去：
+// 这样「注册 → 派单 → 隧道 → 公网能打开 → 释放 → 结账」整条控制面可以在没有 GPU 的机器上实测。
+type mockHandler struct {
+	mu      sync.Mutex
+	tunnels map[string]*mockTunnel
+}
+
+type mockTunnel struct {
+	srv     *http.Server
+	frpc    *exec.Cmd
+	cfgPath string
+}
 
 func (m *mockHandler) Reserve(gpuIndex int) (string, error) {
 	id := fmt.Sprintf("mock-claim-%d-%d", gpuIndex, time.Now().UnixNano())
@@ -42,15 +96,54 @@ func (m *mockHandler) Reserve(gpuIndex int) (string, error) {
 	return id, nil
 }
 
-// mock 模式忽略 command / args。
-func (m *mockHandler) Run(claimID, image string, _ string, _ []string, ports []int, env map[string]string, keep int) (string, error) {
-	url := fmt.Sprintf("https://i-%s.i.cloudgpu.app", claimID)
-	log.Printf("[runtime/mock] run claim=%s image=%s ports=%v env=%d keys keep=%dm -> %s",
-		claimID, image, ports, len(env), keep, url)
+// mock 模式不起容器也不起隧道，回一个隧道地址的样子，给控制面做联调。
+func (m *mockHandler) Run(spec RunSpec) (string, error) {
+	log.Printf("[runtime/mock] run claim=%s image=%s ports=%v env=%d keys",
+		spec.ClaimID, spec.Image, spec.Ports, len(spec.Env))
+	if spec.Tunnel == nil {
+		return fmt.Sprintf("https://i-%s.i.cloudgpu.app", spec.ClaimID), nil
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return "", err
+	}
+	page := fmt.Sprintf("cloudgpu-agent mock: claim=%s image=%s\n", spec.ClaimID, spec.Image)
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, page)
+	})}
+	go func() { _ = srv.Serve(ln) }()
+	cmd, cfgPath, url, err := openTunnel(spec.Tunnel, ln.Addr().(*net.TCPAddr).Port)
+	m.mu.Lock()
+	m.tunnels[spec.ClaimID] = &mockTunnel{srv: srv, frpc: cmd, cfgPath: cfgPath}
+	m.mu.Unlock()
+	if err != nil {
+		_ = m.Release(spec.ClaimID)
+		return "", err
+	}
 	return url, nil
 }
 
+func (m *mockHandler) CleanupOrphans() {}
+
+func (m *mockHandler) Prefetch(images []string, _ []string, _ string) {
+	log.Printf("[runtime/mock] prefetch %v (skipped)", images)
+}
+
 func (m *mockHandler) Release(claimID string) error {
+	m.mu.Lock()
+	t := m.tunnels[claimID]
+	delete(m.tunnels, claimID)
+	m.mu.Unlock()
+	if t != nil {
+		if t.frpc != nil && t.frpc.Process != nil {
+			_ = t.frpc.Process.Kill()
+			_, _ = t.frpc.Process.Wait()
+		}
+		if t.cfgPath != "" {
+			_ = os.Remove(t.cfgPath)
+		}
+		_ = t.srv.Close()
+	}
 	log.Printf("[runtime/mock] release claim=%s", claimID)
 	return nil
 }
@@ -69,25 +162,6 @@ type dockerHandler struct {
 	cacheDir string
 	mu       sync.Mutex
 	claims   map[string]*claim
-}
-
-// frps config from env. If FRPS_SERVER is unset the agent skips frpc
-// spawn and returns a nil service URL — the control plane fills in a
-// fallback URL (which will 502 until the tunnel is live).
-var (
-	frpsServer     = os.Getenv("FRPS_SERVER")         // e.g. "frps.cloudgpu.app:7000"
-	frpsToken      = os.Getenv("FRPS_TOKEN")          // shared secret
-	frpsSubdomain  = os.Getenv("FRPS_SUBDOMAIN_HOST") // e.g. "i.cloudgpu.app"
-	frpcBinaryPath = firstExisting("/usr/local/bin/frpc", "/opt/frp/frpc", "/usr/bin/frpc")
-)
-
-func firstExisting(paths ...string) string {
-	for _, p := range paths {
-		if _, err := os.Stat(p); err == nil {
-			return p
-		}
-	}
-	return ""
 }
 
 func (d *dockerHandler) Reserve(gpuIndex int) (string, error) {
@@ -116,7 +190,7 @@ func (d *dockerHandler) Reserve(gpuIndex int) (string, error) {
 
 	// Step 2: last-moment busy recheck. If nvidia-smi shows any compute
 	// processes on this specific index, somebody got in first.
-	busyOut, _ := exec.Command("nvidia-smi",
+	busyOut, _ := exec.Command(gpuSMI(),
 		"-i", fmt.Sprintf("%d", gpuIndex),
 		"--query-compute-apps=pid",
 		"--format=csv,noheader,nounits",
@@ -131,7 +205,7 @@ func (d *dockerHandler) Reserve(gpuIndex int) (string, error) {
 	// driver configs (headless servers missing persistence daemon) this
 	// call can fail non-fatally. We log + continue; the VRAM-hog inside
 	// our container still provides partial protection.
-	if out, cerr := exec.Command("nvidia-smi",
+	if out, cerr := exec.Command(gpuSMI(),
 		"-i", fmt.Sprintf("%d", gpuIndex),
 		"-c", "EXCLUSIVE_PROCESS",
 	).CombinedOutput(); cerr != nil {
@@ -148,64 +222,76 @@ func (d *dockerHandler) Reserve(gpuIndex int) (string, error) {
 	return id, nil
 }
 
-func (d *dockerHandler) Run(claimID, image string, command string, cmdArgs []string, ports []int, env map[string]string, keepAliveMinutes int) (string, error) {
+func (d *dockerHandler) Run(spec RunSpec) (string, error) {
 	d.mu.Lock()
-	cl, ok := d.claims[claimID]
+	cl, ok := d.claims[spec.ClaimID]
 	d.mu.Unlock()
 	if !ok {
-		return "", fmt.Errorf("unknown claim %s", claimID)
+		return "", fmt.Errorf("unknown claim %s", spec.ClaimID)
+	}
+	if spec.Image == "" {
+		return "", fmt.Errorf("docker_run without an image")
+	}
+	// 镜像还没拉完就立刻失败：hub 只等 5 分钟，几个 GB 的镜像在等的时间里拉不完，
+	// 原来 docker run 自己去拉，客户白等 5 分钟才看到超时。现在马上报错，后台接着拉，下一单就能用。
+	if !imagePresent(spec.Image) {
+		pullInBackground(spec.Image)
+		return "", fmt.Errorf("image %s is not on this machine yet (downloading in the background); try again later", spec.Image)
 	}
 	args := []string{
 		"run", "-d",
-		"--name", "cloudgpu-" + claimID,
+		"--name", "cloudgpu-" + spec.ClaimID,
+		"--label", orphanLabel + "=" + spec.ClaimID,
 		"--gpus", fmt.Sprintf("device=%d", cl.gpuIndex),
+		// PyTorch 的 DataLoader 多进程要共享内存，docker 默认 64M 一跑就崩。
+		"--shm-size", "8g",
 	}
-	// Publish each container port to a random host port (Docker picks).
-	// We'll read the mapping back via `docker port` after the container
-	// starts, then point frpc at the host-side port.
-	for _, p := range ports {
-		args = append(args, "-p", fmt.Sprintf("%d", p))
+	if spec.Entrypoint != "" {
+		args = append(args, "--entrypoint", spec.Entrypoint)
 	}
-	for k, v := range env {
+	if spec.User != "" {
+		args = append(args, "--user", spec.User)
+	}
+	// 端口只发布到本机回环：外面的人只能经隧道进来。原来发布在 0.0.0.0，
+	// 供给方机器有公网 IP 的话，客户的 Jupyter / Ollama 直接裸奔在公网上。
+	for _, p := range spec.Ports {
+		args = append(args, "-p", fmt.Sprintf("127.0.0.1::%d", p))
+	}
+	for k, v := range spec.Env {
 		args = append(args, "-e", k+"="+v)
 	}
-	args = append(args, image)
+	args = append(args, spec.Image)
 	// 镜像名之后紧跟 command + args，即 `docker run ... <image> <command> <args...>`，
 	// 覆盖镜像默认 CMD。command 为空时不追加，让镜像自己的 ENTRYPOINT/CMD 生效。
-	if command != "" {
-		args = append(args, command)
+	if spec.Command != "" {
+		args = append(args, spec.Command)
 	}
-	args = append(args, cmdArgs...)
-	log.Printf("[runtime/docker] %s", strings.Join(append([]string{"docker"}, args...), " "))
+	args = append(args, spec.Args...)
+	log.Printf("[runtime/docker] docker run %s (env %d keys)", spec.Image, len(spec.Env))
 	cmd := exec.Command("docker", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("docker run: %w: %s", err, strings.TrimSpace(string(out)))
 	}
-	containerID := strings.TrimSpace(string(out))
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	containerID := strings.TrimSpace(lines[len(lines)-1])
 	d.mu.Lock()
 	cl.containerID = containerID
 	d.mu.Unlock()
 
-	// Resolve host-side port. The FIRST declared port is what we tunnel;
-	// multi-port containers will grow a json-per-port later.
-	hostPort := 0
-	if len(ports) > 0 {
-		hostPort = inspectHostPort(containerID, ports[0])
+	if spec.Tunnel == nil {
+		// 没有隧道就没有人能连进来。hub 自 0.2.0 起总是下发隧道；没下发说明控制面版本不对，别假装成功。
+		return "", fmt.Errorf("docker_run without tunnel — nothing could reach this container")
 	}
-
-	// Set up frpc tunnel if configured AND we captured a host port.
-	if frpsServer != "" && frpcBinaryPath != "" && hostPort > 0 {
-		if url, ferr := d.startFrpcTunnel(cl, claimID, hostPort); ferr != nil {
-			log.Printf("[runtime/docker] frpc setup failed: %v — service will be unreachable until tunnel restarts", ferr)
-		} else {
-			return url, nil
-		}
+	hostPort := inspectHostPort(containerID, spec.Tunnel.LocalPort)
+	if hostPort == 0 {
+		return "", fmt.Errorf("container port %d is not published", spec.Tunnel.LocalPort)
 	}
-
-	// No tunnel — return empty so the control plane knows to mint a
-	// fallback URL (which will 502 until the tunnel grows up).
-	return "", nil
+	url, err := d.startFrpcTunnel(cl, spec.Tunnel, hostPort)
+	if err != nil {
+		return "", fmt.Errorf("tunnel: %w", err)
+	}
+	return url, nil
 }
 
 // inspectHostPort runs `docker port <id> <container>/tcp` and parses the
@@ -232,62 +318,148 @@ func inspectHostPort(containerID string, containerPort int) int {
 	return 0
 }
 
-// startFrpcTunnel writes a per-claim frpc ini, spawns frpc, and returns
-// the public URL the tunnel resolves to. Cleanup is done in Release via
-// the stored *exec.Cmd. The subdomain is the claim id (URL-safe).
-func (d *dockerHandler) startFrpcTunnel(cl *claim, claimID string, hostPort int) (string, error) {
-	host := frpsSubdomain
-	if host == "" {
-		host = "i.cloudgpu.app"
+// startFrpcTunnel writes a per-claim frpc.toml, spawns frpc, and waits until
+// frps has accepted the proxy. Cleanup is done in Release via the stored
+// *exec.Cmd. Format matches the backend's ApiTunnelInstaller (TOML, TLS,
+// customDomains = <id>-i.cloudgpu.app).
+func (d *dockerHandler) startFrpcTunnel(cl *claim, t *Tunnel, hostPort int) (string, error) {
+	cmd, cfgPath, url, err := openTunnel(t, hostPort)
+	if cmd != nil {
+		d.mu.Lock()
+		cl.frpcCmd = cmd
+		cl.frpcCfgPath = cfgPath
+		d.mu.Unlock()
 	}
-
-	cfgDir := "/var/run/cloudgpu-agent"
-	_ = os.MkdirAll(cfgDir, 0755)
-	cfgPath := filepath.Join(cfgDir, "frpc-"+claimID+".ini")
-
-	// frp 0.x / 1.x still accept INI. The HTTP vhost on frps routes
-	// subdomain.<host> -> this tunnel -> local_port.
-	cfg := fmt.Sprintf(`[common]
-server_addr = %s
-token = %s
-log_level = warn
-
-[cloudgpu-%s]
-type = http
-local_ip = 127.0.0.1
-local_port = %d
-subdomain = %s
-`, frpsServerAddr(frpsServer),
-		frpsToken, claimID, hostPort, claimID)
-
-	if err := os.WriteFile(cfgPath, []byte(cfg), 0600); err != nil {
-		return "", fmt.Errorf("write frpc config: %w", err)
-	}
-
-	cmd := exec.Command(frpcBinaryPath, "-c", cfgPath)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
-		return "", fmt.Errorf("spawn frpc: %w", err)
-	}
-	d.mu.Lock()
-	cl.frpcCmd = cmd
-	cl.frpcCfgPath = cfgPath
-	d.mu.Unlock()
-
-	url := fmt.Sprintf("https://%s.%s/", claimID, host)
-	log.Printf("[runtime/docker] frpc tunnel up: %s -> localhost:%d", url, hostPort)
-	return url, nil
+	return url, err
 }
 
-// frpsServerAddr 给没带端口的 FRPS_SERVER 补上默认 :7000。
-// 以前是 TrimSuffix(":7000")+":7000"，"host:7001" 会变成 "host:7001:7000"。
-// 用 net.SplitHostPort 判断：能拆出端口就原样返回（含 [::1]:7000 这种 IPv6 写法）。
-func frpsServerAddr(server string) string {
-	if _, _, err := net.SplitHostPort(server); err == nil {
-		return server
+// openTunnel 起 frpc 并等 frps 放行。返回的 cmd 非空时由调用方负责在释放时杀掉。
+func openTunnel(t *Tunnel, hostPort int) (*exec.Cmd, string, string, error) {
+	if t.ProxyName == "" || t.CustomDomain == "" || t.ServerAddr == "" {
+		return nil, "", "", fmt.Errorf("incomplete tunnel spec")
 	}
-	return server + ":7000"
+	bin, err := ensureFrpc(t.FrpcURLs, t.FrpcSHA256)
+	if err != nil {
+		return nil, "", "", err
+	}
+	cfgDir := "/var/run/cloudgpu-agent"
+	_ = os.MkdirAll(cfgDir, 0700)
+	cfgPath := filepath.Join(cfgDir, "frpc-"+t.ProxyName+".toml")
+	logPath := filepath.Join(cfgDir, "frpc-"+t.ProxyName+".log")
+	port := t.ServerPort
+	if port == 0 {
+		port = 7000
+	}
+	bw := ""
+	if t.Bandwidth != "" {
+		bw = fmt.Sprintf("transport.bandwidthLimit = %q\ntransport.bandwidthLimitMode = \"server\"\n", t.Bandwidth)
+	}
+	cfg := fmt.Sprintf(`serverAddr = %q
+serverPort = %d
+auth.method = "token"
+auth.token = %q
+transport.tls.enable = true
+loginFailExit = false
+log.to = %q
+log.level = "info"
+
+[[proxies]]
+name = %q
+type = "http"
+localIP = "127.0.0.1"
+localPort = %d
+customDomains = [%q]
+%s`, t.ServerAddr, port, t.Token, logPath, t.ProxyName, hostPort, t.CustomDomain, bw)
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0600); err != nil {
+		return nil, "", "", fmt.Errorf("write frpc config: %w", err)
+	}
+	_ = os.Remove(logPath)
+	cmd := exec.Command(bin, "-c", cfgPath)
+	// 供给方机器上常带着 http_proxy（国内机房尤其）：frpc 走代理连我们 IP 会断，必须直连。
+	cmd.Env = withoutProxy(os.Environ())
+	if err := cmd.Start(); err != nil {
+		return nil, "", "", fmt.Errorf("spawn frpc: %w", err)
+	}
+
+	// 等 frps 放行（日志里出现 start proxy success）。不等的话 hub 会把一个还没通的地址交给客户。
+	deadline := time.Now().Add(45 * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(1 * time.Second)
+		b, _ := os.ReadFile(logPath)
+		text := string(b)
+		if strings.Contains(text, "start proxy success") {
+			url := "https://" + t.CustomDomain
+			log.Printf("[runtime] tunnel up: %s -> localhost:%d", url, hostPort)
+			return cmd, cfgPath, url, nil
+		}
+		if strings.Contains(text, "start error") || strings.Contains(text, "reject") {
+			return cmd, cfgPath, "", fmt.Errorf("frps refused the tunnel: %s", lastLine(text))
+		}
+	}
+	b, _ := os.ReadFile(logPath)
+	return cmd, cfgPath, "", fmt.Errorf("frpc did not connect within 45s: %s", lastLine(string(b)))
+}
+
+func lastLine(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.LastIndex(s, "\n"); i >= 0 {
+		s = s[i+1:]
+	}
+	if len(s) > 300 {
+		s = s[len(s)-300:]
+	}
+	return s
+}
+
+func withoutProxy(env []string) []string {
+	out := env[:0:0]
+	for _, kv := range env {
+		k := strings.ToLower(strings.SplitN(kv, "=", 2)[0])
+		if k == "http_proxy" || k == "https_proxy" || k == "all_proxy" {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
+// frpc 放在 agent 自己的目录里，不碰供给方系统里可能已有的别的 frpc。
+const frpcPath = "/usr/local/lib/cloudgpu-agent/frpc"
+
+var frpcMu sync.Mutex
+
+// ensureFrpc 返回可用的 frpc 路径：已有且校验通过就直接用，否则按顺序下载（.gz 自动解压）并校验 sha256。
+func ensureFrpc(urls []string, sha string) (string, error) {
+	frpcMu.Lock()
+	defer frpcMu.Unlock()
+	if ok, _ := fileSHA256Matches(frpcPath, sha); ok {
+		return frpcPath, nil
+	}
+	if len(urls) == 0 {
+		return "", fmt.Errorf("frpc missing and no download url")
+	}
+	_ = os.MkdirAll(filepath.Dir(frpcPath), 0755)
+	var lastErr error
+	for _, u := range urls {
+		tmp := frpcPath + ".tmp"
+		if err := download(u, tmp); err != nil {
+			lastErr = err
+			continue
+		}
+		if ok, got := fileSHA256Matches(tmp, sha); !ok {
+			lastErr = fmt.Errorf("sha256 mismatch from %s: %s", u, got)
+			_ = os.Remove(tmp)
+			continue
+		}
+		_ = os.Chmod(tmp, 0755)
+		if err := os.Rename(tmp, frpcPath); err != nil {
+			lastErr = err
+			continue
+		}
+		log.Printf("[runtime/docker] frpc installed from %s", u)
+		return frpcPath, nil
+	}
+	return "", fmt.Errorf("could not install frpc: %v", lastErr)
 }
 
 // unused helper to keep encoding/json imported in case we expand run_ack
@@ -320,7 +492,7 @@ func (d *dockerHandler) Release(claimID string) error {
 	// (Vast, RunPod) can again launch containers on this GPU. Best-effort —
 	// failure only means the GPU stays in EXCLUSIVE mode until next reboot
 	// or agent restart, which is a degraded but not broken state.
-	if out, cerr := exec.Command("nvidia-smi",
+	if out, cerr := exec.Command(gpuSMI(),
 		"-i", fmt.Sprintf("%d", cl.gpuIndex),
 		"-c", "DEFAULT",
 	).CombinedOutput(); cerr != nil {
@@ -335,6 +507,113 @@ func (d *dockerHandler) Release(claimID string) error {
 	}
 	log.Printf("[runtime/docker] released claim=%s, gpu %d back to DEFAULT", claimID, cl.gpuIndex)
 	return nil
+}
+
+const orphanLabel = "cloudgpu.claim"
+
+func gpuSMI() string { return gpu.SMIPath() }
+
+func download(url, dst string) error {
+	client := &http.Client{
+		Timeout: 4 * time.Minute,
+		// 直连：供给方机器上的 http_proxy 到我们 IP 常常是断的。
+		Transport: &http.Transport{Proxy: nil},
+	}
+	resp, err := client.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("GET %s: %s", url, resp.Status)
+	}
+	var r io.Reader = resp.Body
+	if strings.HasSuffix(url, ".gz") {
+		gz, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			return err
+		}
+		defer gz.Close()
+		r = gz
+	}
+	f, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0755)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(f, r); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// fileSHA256Matches：want 为空时只要文件存在就算过（hub 没下发校验值）。
+func fileSHA256Matches(path, want string) (bool, string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return false, ""
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return false, ""
+	}
+	got := hex.EncodeToString(h.Sum(nil))
+	return want == "" || strings.EqualFold(got, want), got
+}
+
+// CleanupOrphans 删掉带我们标签的容器，并把所有卡的计算模式恢复成 DEFAULT。
+// 只在启动时调用：此刻内存里没有任何 claim，凡是带标签的容器都是上一个进程留下的。
+func (d *dockerHandler) CleanupOrphans() {
+	out, err := exec.Command("docker", "ps", "-aq", "--filter", "label="+orphanLabel).Output()
+	if err != nil {
+		log.Printf("[runtime/docker] WARN: list orphan containers: %v", err)
+		return
+	}
+	ids := strings.Fields(string(out))
+	for _, id := range ids {
+		_ = exec.Command("docker", "rm", "-f", id).Run()
+	}
+	if len(ids) > 0 {
+		log.Printf("[runtime/docker] removed %d orphan container(s) from a previous run", len(ids))
+		_ = exec.Command(gpuSMI(), "-c", "DEFAULT").Run()
+	}
+}
+
+var prefetchMu sync.Mutex
+
+func (d *dockerHandler) Prefetch(images []string, frpcURLs []string, frpcSHA256 string) {
+	go func() {
+		// 一次只拉一轮：agent 断线重连会再收到一次 prefetch，别叠着拉。
+		if !prefetchMu.TryLock() {
+			return
+		}
+		defer prefetchMu.Unlock()
+		if len(frpcURLs) > 0 {
+			if _, err := ensureFrpc(frpcURLs, frpcSHA256); err != nil {
+				log.Printf("[runtime/docker] prefetch frpc failed (will retry on first rental): %v", err)
+			}
+		}
+		for _, img := range images {
+			if img == "" {
+				continue
+			}
+			if imagePresent(img) {
+				continue
+			}
+			log.Printf("[runtime/docker] prefetch: pulling %s", img)
+			start := time.Now()
+			started, err := pullTracked(img)
+			if !started {
+				continue
+			}
+			if err != nil {
+				log.Printf("[runtime/docker] prefetch %s failed: %v", img, err)
+				continue
+			}
+			log.Printf("[runtime/docker] prefetch %s done in %s", img, time.Since(start).Round(time.Second))
+		}
+	}()
 }
 
 // keepAlive timer hooks: future work. The agent currently relies on the

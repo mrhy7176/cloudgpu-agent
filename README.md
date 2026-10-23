@@ -12,8 +12,10 @@ Supplier-side agent that connects a GPU host to the CloudGPU control plane.
   sharing the same host is safe.
 - Runs containers with `docker run --gpus device=<i>` + persistent cache
   volumes per template.
-- Opens a reverse tunnel via `frpc` so the container's ports are reachable
-  at `https://i-<claimId>.i.cloudgpu.app`.
+- Opens a reverse tunnel via `frpc` so the container's port is reachable
+  at `https://<tunnelId>-i.cloudgpu.app` (the hub issues and registers the id).
+- Pulls the container images in the background as soon as it connects, so the
+  first rental does not wait on a multi-GB download.
 
 ## Install (supplier side)
 
@@ -42,21 +44,17 @@ The agent supports two runtime modes selected via `--runtime=` or
   commands return fake success with a fake service URL. Used for end-to-end
   testing of the hub and scheduler without needing a real GPU.
 
-## Tunnel configuration (docker mode)
+## Tunnel (docker mode)
 
-The frpc tunnel is configured through environment variables read at agent
-start. If `FRPS_SERVER` is unset (or no `frpc` binary is found at
-`/usr/local/bin/frpc`, `/opt/frp/frpc` or `/usr/bin/frpc`) the agent skips the
-tunnel and returns an empty `service_url`; the hub then mints a fallback URL.
+Nothing to configure on the supplier side. For every rental the hub sends a
+`tunnel` object inside `docker_run` (server address, a per-lease proxy name,
+`customDomains = <id>-i.cloudgpu.app`, frpc download URLs + sha256). The agent
+downloads frpc to `/usr/local/lib/cloudgpu-agent/frpc` if it is missing,
+verifies the sha256, writes `/var/run/cloudgpu-agent/frpc-<id>.toml` and waits
+until frps accepts the proxy before acking. frps' auth plugin only accepts ids
+the hub registered, so the shared frps token cannot publish anything else.
 
-| Variable              | Required | Default          | Meaning                                                                                  |
-| --------------------- | :------: | ---------------- | ---------------------------------------------------------------------------------------- |
-| `FRPS_SERVER`         | no       | (tunnel off)     | frps `server_addr`, e.g. `frps.cloudgpu.app:7000`. `:7000` is appended only if no port is given. |
-| `FRPS_TOKEN`          | no       | empty            | Shared secret written to frpc `[common] token`. Must match the frps side.               |
-| `FRPS_SUBDOMAIN_HOST` | no       | `i.cloudgpu.app` | Wildcard host the frps HTTP vhost serves; the container is reachable at `https://<claimId>.<host>/`. |
-
-Per-claim frpc INI files are written to `/var/run/cloudgpu-agent/frpc-<claimId>.ini`
-and removed on release.
+Container ports are published on `127.0.0.1` only; the tunnel is the only way in.
 
 ## Status
 
@@ -67,15 +65,18 @@ and the docker runtime is real (not stubbed):
   re-checks `nvidia-smi --query-compute-apps` so a card another platform just
   grabbed is refused, then sets the GPU compute mode to `EXCLUSIVE_PROCESS` so
   no other CUDA context can start on it while we hold the claim.
-- **docker_run** — `docker run -d --gpus device=<i> -p <port> -e K=V <image>
-  [command] [args...]`, publishes each container port to a random host port,
-  reads the mapping back via `docker port`, and spawns `frpc` for the first
-  port so the container is reachable at `https://<claimId>.<FRPS_SUBDOMAIN_HOST>/`.
-- **release** — kills frpc, removes its INI, `docker stop` + `docker rm -f`,
+- **docker_run** — `docker run -d --gpus device=<i> --shm-size 8g -p 127.0.0.1::<port>
+  [--entrypoint] [--user] -e K=V <image> [command] [args...]`, reads the host
+  port back via `docker port`, and starts frpc for the hub-issued tunnel.
+- **release** — kills frpc, removes its config, `docker stop` + `docker rm -f`,
   restores compute mode `DEFAULT`, and only then drops the flock.
 - **heartbeat** — every 15 s, per GPU: `utilization_pct`, `compute_processes`
   (count) and `compute_process_names` (used by the hub-side watch service).
 
+- **startup** — removes containers labelled `cloudgpu.claim` left by a
+  previous process (claims live in memory; the hub has already closed those
+  leases as an outage) and restores compute mode `DEFAULT`.
+
 Known gaps: `keep_alive_minutes` is accepted but not enforced (the hub must
-send an explicit release); only the first declared port is tunnelled;
-`memory_gb` in register is still reported as 0.
+send an explicit release); only one port per rental is tunnelled; ARM hosts
+are not supported yet.
