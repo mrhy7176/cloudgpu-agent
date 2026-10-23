@@ -26,12 +26,16 @@ func (a *agentHandler) OnReserve(reqID string, gpuIndex int) (string, error) {
 	return a.rt.Reserve(gpuIndex)
 }
 
-func (a *agentHandler) OnDockerRun(reqID, claimID, image string, command string, args []string, ports []int, env map[string]string, keepAlive int) (string, error) {
-	return a.rt.Run(claimID, image, command, args, ports, env, keepAlive)
+func (a *agentHandler) OnDockerRun(reqID string, spec runtime.RunSpec) (string, error) {
+	return a.rt.Run(spec)
 }
 
 func (a *agentHandler) OnRelease(claimID string) error {
 	return a.rt.Release(claimID)
+}
+
+func (a *agentHandler) OnPrefetch(images []string) {
+	a.rt.Prefetch(images)
 }
 
 func main() {
@@ -66,6 +70,7 @@ func main() {
 		cfg.Runtime, cfg.HubURL, cfg.HeartbeatSeconds, cfg.CacheDir, cfg.CacheMaxGB)
 
 	rt := runtime.NewHandler(cfg.Runtime, cfg.CacheDir)
+	rt.CleanupOrphans()
 	handler := &agentHandler{rt: rt}
 	client := hub.New(cfg, handler)
 

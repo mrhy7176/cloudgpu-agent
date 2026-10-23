@@ -16,16 +16,17 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/mrhy7176/cloudgpu-agent/internal/config"
 	"github.com/mrhy7176/cloudgpu-agent/internal/gpu"
+	agentrt "github.com/mrhy7176/cloudgpu-agent/internal/runtime"
 )
 
 // Handler is what the main loop passes in to receive commands from the hub.
 // Returning an error lets the client log and, optionally, send a nack.
 type Handler interface {
 	OnReserve(reqID string, gpuIndex int) (claimID string, err error)
-	// command / args 是模板对镜像默认 ENTRYPOINT/CMD 的覆盖（hub 侧
-	// P2PAgentAdapter.createInstance 下发），可以为空。
-	OnDockerRun(reqID, claimID, image string, command string, args []string, ports []int, env map[string]string, keepAlive int) (serviceURL string, err error)
+	// spec 由 hub 侧 P2PAgentAdapter.createInstance 下发：镜像、启动参数、隧道。
+	OnDockerRun(reqID string, spec agentrt.RunSpec) (serviceURL string, err error)
 	OnRelease(claimID string) error
+	OnPrefetch(images []string)
 }
 
 // Client is a long-lived connection to the CloudGPU hub. It owns the socket,
@@ -129,13 +130,17 @@ func (c *Client) sendRegister() error {
 		}
 		gpus = scanned
 	}
+	if gpus == nil {
+		// nil 序列化成 null，hub 那边就不写这一栏，后台看到的是「没报过」而不是「0 张」。
+		gpus = []gpu.Device{}
+	}
 	payload := map[string]interface{}{
 		"type":      "register",
 		"agent_id":  c.agentID,
 		"hostname":  c.hostname,
 		"os":        runtime.GOOS + "-" + runtime.GOARCH,
 		"cpu_cores": runtime.NumCPU(),
-		"memory_gb": 0, // TODO: read from /proc/meminfo
+		"memory_gb": gpu.MemoryGB(),
 		"version":   AgentVersion,
 		"gpus":      gpus,
 	}
@@ -155,6 +160,9 @@ func (c *Client) heartbeatLoop(ctx context.Context) error {
 				gpus = gpu.MockScan()
 			} else {
 				gpus, _ = gpu.Scan()
+			}
+			if gpus == nil {
+				gpus = []gpu.Device{}
 			}
 			if err := c.sendJSON(map[string]interface{}{
 				"type":     "heartbeat",
@@ -181,7 +189,9 @@ func (c *Client) readLoop(ctx context.Context) error {
 			}
 			return fmt.Errorf("read: %w", err)
 		}
-		c.dispatch(msg)
+		// 每条命令单独跑：docker_run 第一次拉镜像要好几分钟，原来同步处理时，
+		// 这期间 release / ping 全堵在后面。发送端有 writeMu，并发写是安全的。
+		go c.dispatch(msg)
 	}
 }
 
@@ -214,19 +224,28 @@ func (c *Client) dispatch(raw []byte) {
 		_ = c.sendJSON(ack)
 
 	case "docker_run":
-		claimID, _ := generic["claim_id"].(string)
-		image, _ := generic["image"].(string)
+		spec := agentrt.RunSpec{KeepAliveMinutes: 60}
+		spec.ClaimID, _ = generic["claim_id"].(string)
+		spec.Image, _ = generic["image"].(string)
+		spec.Entrypoint, _ = generic["entrypoint"].(string)
+		spec.User, _ = generic["user"].(string)
 		// hub 会带 command(string) + args([]string)，以前直接被丢掉了，
 		// 结果模板自定义的启动命令在 P2P 卡上根本没生效。
-		command, _ := generic["command"].(string)
-		args := toStringList(generic["args"])
-		ports := toIntList(generic["ports"])
-		env := toStringMap(generic["env"])
-		keepAlive := 60
+		spec.Command, _ = generic["command"].(string)
+		spec.Args = toStringList(generic["args"])
+		spec.Ports = toIntList(generic["ports"])
+		spec.Env = toStringMap(generic["env"])
 		if v, ok := generic["keep_alive_minutes"].(float64); ok {
-			keepAlive = int(v)
+			spec.KeepAliveMinutes = int(v)
 		}
-		url, err := c.handler.OnDockerRun(reqID, claimID, image, command, args, ports, env, keepAlive)
+		if raw, ok := generic["tunnel"]; ok && raw != nil {
+			b, _ := json.Marshal(raw)
+			var t agentrt.Tunnel
+			if err := json.Unmarshal(b, &t); err == nil {
+				spec.Tunnel = &t
+			}
+		}
+		url, err := c.handler.OnDockerRun(reqID, spec)
 		ack := map[string]interface{}{
 			"type":     "run_ack",
 			"req_id":   reqID,
@@ -255,6 +274,9 @@ func (c *Client) dispatch(raw []byte) {
 			"agent_id": c.agentID,
 			"ok":       err == nil,
 		})
+
+	case "prefetch":
+		c.handler.OnPrefetch(toStringList(generic["images"]))
 
 	case "ping":
 		_ = c.sendJSON(map[string]interface{}{"type": "pong", "agent_id": c.agentID})
@@ -332,4 +354,4 @@ func toStringMap(v interface{}) map[string]string {
 
 // AgentVersion is injected at build time via -ldflags -X. The default
 // placeholder value is used in development builds.
-var AgentVersion = "0.1.0-dev"
+var AgentVersion = "0.2.0"
