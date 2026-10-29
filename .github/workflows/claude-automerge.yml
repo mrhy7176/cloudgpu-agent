@@ -134,3 +134,11 @@ jobs:
           gh api -X DELETE "repos/$REPO/git/refs/heads/$BRANCH" --silent 2>/dev/null || true
           echo "已 squash 合并 PR #$PR 并删除分支 $BRANCH"
           comment "✅ claude-automerge：PR #$PR 已 squash 合并到 \`$BASE\`，分支已删除。"
+
+          # 4. GITHUB_TOKEN 合并时 GitHub 不会按 Closes #号 自动关 issue，这里手动关掉 PR 关联的 issue
+          LINKED=$(gh api graphql -F owner="$OWNER" -F name="${REPO#*/}" -F pr="$PR" \
+            -f query='query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){pullRequest(number:$pr){closingIssuesReferences(first:10){nodes{number state}}}}}' \
+            --jq '.data.repository.pullRequest.closingIssuesReferences.nodes[] | select(.state == "OPEN") | .number' || true)
+          for n in $LINKED; do
+            gh api -X PATCH "repos/$REPO/issues/$n" -f state=closed -f state_reason=completed --silent && echo "已关闭 issue #$n" || true
+          done
