@@ -1,0 +1,144 @@
+# Claude 改动的自动合并兜底。
+#
+# 处理对象：head 分支以 claude/issue- 或 claude/pr- 开头（claude-code-action 自动起的分支名）、
+# 来自本仓库、目标是默认分支、作者是 Claude App(claude[bot]) / mrhy7176 / github-actions[bot] 的 PR。
+# 其它 claude/ 分支（比如手工建的 claude/cloudgpu-takeover-*）不会被自动合并。
+#
+# 两种触发：
+#   1. pull_request：Claude 用 Claude App 令牌开的 PR 会触发（GITHUB_TOKEN 开的 PR 不会触发 workflow）。
+#   2. workflow_dispatch：claude.yml 的 handoff job 在 Claude 跑完后触发；如果 Claude 没开 PR，
+#      这里用 GITHUB_TOKEN 补开一个（需要仓库设置里允许 Actions 创建 PR）。
+# 流程：等除本 job 以外的检查全部跑完且通过 → squash 合并 → 删分支 → 在 issue 里回帖。
+# Claude 已经自己合并的话，这里发现没有打开的 PR，直接结束。
+# 注意：用 GITHUB_TOKEN 合并不会触发默认分支上的 push workflow；改了 .github/workflows 的 PR 也合不了（没有 workflows 权限），需要人工处理。
+name: Claude Auto-merge
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Claude 的分支名（claude/issue-* 或 claude/pr-*）"
+        required: true
+        type: string
+      issue:
+        description: "对应的 issue 号（可选，用于 PR 正文和回帖）"
+        required: false
+        type: string
+
+concurrency:
+  group: claude-automerge-${{ github.head_ref || inputs.branch }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  automerge:
+    name: automerge
+    if: |
+      (github.event_name == 'workflow_dispatch' && (startsWith(inputs.branch, 'claude/issue-') || startsWith(inputs.branch, 'claude/pr-'))) ||
+      (github.event_name == 'pull_request' && !github.event.pull_request.draft &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        github.event.pull_request.base.ref == github.event.repository.default_branch &&
+        (startsWith(github.head_ref, 'claude/issue-') || startsWith(github.head_ref, 'claude/pr-')) &&
+        contains(fromJSON('["claude[bot]", "mrhy7176", "github-actions[bot]"]'), github.event.pull_request.user.login))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      checks: read
+      statuses: read
+    steps:
+      - name: 等检查通过后 squash 合并
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          BASE: ${{ github.event.repository.default_branch }}
+          BRANCH: ${{ github.head_ref || inputs.branch }}
+          ISSUE_INPUT: ${{ inputs.issue }}
+        run: |
+          set -euo pipefail
+
+          # issue 号：优先用输入，否则从 claude/issue-<号>-... 分支名里解析
+          ISSUE="$ISSUE_INPUT"
+          if [ -z "$ISSUE" ] && [[ "$BRANCH" =~ ^claude/issue-([0-9]+)- ]]; then ISSUE="${BASH_REMATCH[1]}"; fi
+
+          comment() {  # 在 issue 回帖；没有 issue 号就回在 PR 上
+            local target="${ISSUE:-${PR:-}}"
+            [ -n "$target" ] && gh api -X POST "repos/$REPO/issues/$target/comments" -f body="$1" --silent || true
+          }
+
+          # 1. 找这个分支打开着的 PR；没有就看要不要补开一个
+          PR=$(gh api "repos/$REPO/pulls?state=open&base=$BASE&head=$OWNER:$BRANCH" --jq '.[0].number // empty')
+          if [ -z "$PR" ]; then
+            if ! gh api "repos/$REPO/branches/$BRANCH" --silent 2>/dev/null; then
+              echo "分支 $BRANCH 不存在（多半是 Claude 已经合并并删除了），无事可做"; exit 0
+            fi
+            if [ "$(gh api "repos/$REPO/pulls?state=closed&head=$OWNER:$BRANCH" --jq 'length')" != "0" ]; then
+              echo "分支 $BRANCH 已经有关闭/合并过的 PR，不重复开"; exit 0
+            fi
+            AHEAD=$(gh api "repos/$REPO/compare/$BASE...$BRANCH" --jq '.ahead_by')
+            if [ "$AHEAD" = "0" ]; then echo "分支 $BRANCH 没有新提交，无事可做"; exit 0; fi
+            TITLE=$(gh api "repos/$REPO/commits/$BRANCH" --jq '.commit.message | split("\n")[0]')
+            BODY="Claude Code 的改动（Claude 没有自己开 PR，由 claude-automerge 兜底创建）。"
+            [ -n "$ISSUE" ] && BODY="$BODY
+
+          Closes #$ISSUE"
+            PR=$(gh api -X POST "repos/$REPO/pulls" -f title="$TITLE" -f head="$BRANCH" -f base="$BASE" -f body="$BODY" --jq '.number')
+            echo "已补开 PR #$PR"
+          fi
+
+          read -r AUTHOR DRAFT < <(gh api "repos/$REPO/pulls/$PR" --jq '[.user.login, (.draft|tostring)] | @tsv')
+          case "$AUTHOR" in
+            "claude[bot]"|mrhy7176|"github-actions[bot]") ;;
+            *) echo "PR #$PR 作者是 $AUTHOR，不自动合并"; exit 0 ;;
+          esac
+          if [ "$DRAFT" = "true" ]; then echo "PR #$PR 是草稿，不自动合并"; exit 0; fi
+
+          # 2. 等除本 job 以外的检查（check runs + commit statuses）全部完成
+          DEADLINE=$((SECONDS + 1500))
+          while :; do
+            STATE=$(gh api "repos/$REPO/pulls/$PR" --jq '.state')
+            if [ "$STATE" != "open" ]; then echo "PR #$PR 已经是 $STATE（可能 Claude 已经合并了），结束"; exit 0; fi
+            SHA=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha')
+            RUNS=$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" --jq '[.check_runs[] | select(.name != "automerge")]')
+            PENDING=$(jq '[.[] | select(.status != "completed")] | length' <<<"$RUNS")
+            FAILED=$(jq -r '[.[] | select(.status == "completed" and ((.conclusion == "success" or .conclusion == "neutral" or .conclusion == "skipped") | not)) | .name] | join(", ")' <<<"$RUNS")
+            read -r CSTATE CCOUNT < <(gh api "repos/$REPO/commits/$SHA/status" --jq '[.state, (.total_count|tostring)] | @tsv')
+            if [ -n "$FAILED" ] || { [ "$CCOUNT" != "0" ] && { [ "$CSTATE" = "failure" ] || [ "$CSTATE" = "error" ]; }; }; then
+              comment "⚠️ PR #$PR 有检查没通过（${FAILED:-commit status $CSTATE}），没有自动合并，需要人工看一下。"
+              echo "检查失败：${FAILED:-commit status $CSTATE}"; exit 1
+            fi
+            if [ "$PENDING" = "0" ] && { [ "$CCOUNT" = "0" ] || [ "$CSTATE" = "success" ]; }; then break; fi
+            if [ $SECONDS -gt $DEADLINE ]; then
+              comment "⚠️ PR #$PR 的检查 25 分钟还没跑完，没有自动合并。"
+              echo "等检查超时"; exit 1
+            fi
+            echo "还有检查在跑（check runs 未完成 $PENDING 个，commit status $CSTATE），30 秒后再看"; sleep 30
+          done
+
+          # 3. squash 合并（带上 sha，保证合并的就是刚检查过的那个提交），再删分支
+          for i in 1 2 3 4 5; do
+            if gh api -X PUT "repos/$REPO/pulls/$PR/merge" -f merge_method=squash -f sha="$SHA" --silent; then MERGED=1; break; fi
+            if [ "$(gh api "repos/$REPO/pulls/$PR" --jq '.merged')" = "true" ]; then echo "PR #$PR 已被合并"; exit 0; fi
+            echo "合并失败，第 $i 次，15 秒后重试"; sleep 15
+          done
+          if [ -z "${MERGED:-}" ]; then
+            comment "⚠️ PR #$PR 自动合并失败（可能有冲突，或改动涉及 .github/workflows），需要人工处理。"
+            exit 1
+          fi
+          gh api -X DELETE "repos/$REPO/git/refs/heads/$BRANCH" --silent 2>/dev/null || true
+          echo "已 squash 合并 PR #$PR 并删除分支 $BRANCH"
+          comment "✅ claude-automerge：PR #$PR 已 squash 合并到 \`$BASE\`，分支已删除。"
+
+          # 4. GITHUB_TOKEN 合并时 GitHub 不会按 Closes #号 自动关 issue，这里手动关掉 PR 关联的 issue
+          LINKED=$(gh api graphql -F owner="$OWNER" -F name="${REPO#*/}" -F pr="$PR" \
+            -f query='query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){pullRequest(number:$pr){closingIssuesReferences(first:10){nodes{number state}}}}}' \
+            --jq '.data.repository.pullRequest.closingIssuesReferences.nodes[] | select(.state == "OPEN") | .number' || true)
+          for n in $LINKED; do
+            gh api -X PATCH "repos/$REPO/issues/$n" -f state=closed -f state_reason=completed --silent && echo "已关闭 issue #$n" || true
+          done
