@@ -1,0 +1,97 @@
+# Claude Code GitHub Action：在 issue / PR 里 @claude 时让 Claude 干活。
+# 文档：https://code.claude.com/docs/en/github-actions
+#
+# 只认仓库所有者 mrhy7176：外人在公开 issue 里 @claude 不会启动 runner，也不会消耗额度。
+# 凭证放在仓库 Secrets 里，二选一：
+#   ANTHROPIC_API_KEY        —— Claude Console 的 API key（按 token 计费）
+#   CLAUDE_CODE_OAUTH_TOKEN  —— 本地 `claude setup-token` 生成的订阅令牌（走订阅额度）
+# 没设置的那个是空字符串，action 会用另一个。
+#
+# 全自动流程：issue 里 @claude 让它改代码 → Claude 在 claude/issue-* 分支提交 → 自己 gh pr create
+# → 检查通过后 gh pr merge --squash --delete-branch → 在 issue 评论里写 PR 链接和合并结果。
+# Claude 用的是 Claude GitHub App 的令牌（不是 GITHUB_TOKEN），所以它开的 PR 会触发
+# claude-automerge.yml；万一 Claude 没开 PR / 没合并，下面的 handoff job 会把分支交给
+# claude-automerge.yml 兜底（开 PR + 等检查 + squash 合并）。
+name: Claude Code
+
+on:
+  issues:
+    types: [opened, assigned]
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  claude:
+    if: |
+      github.actor == 'mrhy7176' && (
+        (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
+        (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      )
+    # 同一个 issue / PR 一次只跑一个，后来的排队，不并发烧额度。
+    # 放在 job 级别：Claude 自己的回帖触发的 run 会被 if 跳过，不会占队列把你的下一条 @claude 挤掉。
+    concurrency:
+      group: claude-${{ github.event.issue.number || github.event.pull_request.number }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+    outputs:
+      branch_name: ${{ steps.claude.outputs.branch_name }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+      - id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # 每次最多 30 轮，防止一个请求跑飞。
+          # allowedTools：在 action 自带的 git add/commit/push(包装脚本，禁止任何 flag，所以无法 force push)
+          # 之外，放开开 PR / 合并 PR / 看检查所需的 gh 命令，以及常见的测试、构建命令。
+          claude_args: |
+            --max-turns 30
+            --allowedTools "Bash(gh pr create:*),Bash(gh pr merge:*),Bash(gh pr view:*),Bash(gh pr checks:*),Bash(gh pr list:*),Bash(gh issue view:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git branch:*),Bash(npm ci:*),Bash(npm install:*),Bash(npm test:*),Bash(npm run:*),Bash(npx tsc:*),Bash(pip install:*),Bash(pytest:*),Bash(python3 -m pytest:*),Bash(python -m pytest:*),Bash(mvn:*)"
+            --disallowedTools "Bash(git push:*),Bash(git reset:*),Bash(git rebase:*),Bash(gh api:*),Bash(gh secret:*),Bash(gh workflow:*),Bash(gh repo:*)"
+            --append-system-prompt "仓库所有者 mrhy7176 的额外规则（优先于默认说明）。一：被要求改代码时，只在本次运行给你的 claude/ 分支上提交，并且只用系统提供的 git-push 包装脚本推送这个分支；绝不 force push，绝不直接推送或提交到默认分支 master，绝不修改 .github/workflows 目录下的任何文件，绝不读取、打印或改动 secrets 和任何凭证。二：推送前，如果仓库有现成的测试或构建命令（package.json 里的 test、build、lint 脚本，pytest，mvn test 等），先跑；失败就修，修不好就不要合并，在评论里说明原因。三：在 issue 里改完并推送后，你被明确授权自己开 PR 并合并，这一条覆盖默认说明里只给 Create a PR 链接、不能合并分支的限制：先用 gh pr create --base master --head 你的分支 --title 简短标题 --body 改动说明，正文里必须写 Closes #issue号；再用 gh pr checks PR号 --watch 等检查跑完（报 no checks 说明仓库没有检查，可以直接继续）；检查全部通过后用 gh pr merge PR号 --squash --delete-branch 合并。四：最后在你的进度评论里写上 PR 链接和合并结果（已合并，或未合并及原因）。五：只是提问、没有改代码时，正常回答，不要开 PR。六：在已有 PR 上被 @ 时，把提交推到该 PR 的分支即可，不要另开 PR；只有分支名以 claude/issue- 或 claude/pr- 开头的 PR 才可以由你合并。"
+
+  # 兜底：issue 里触发、Claude 推了分支但可能没开 PR / 没合并时，交给 claude-automerge.yml。
+  # 用 GITHUB_TOKEN 触发 workflow_dispatch 是允许的（GITHUB_TOKEN 只有 dispatch 类事件能触发新的 workflow）。
+  handoff:
+    needs: claude
+    if: always() && needs.claude.result != 'skipped' && needs.claude.outputs.branch_name != '' && github.event.issue && !github.event.issue.pull_request
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: 把 Claude 的分支交给 claude-automerge.yml
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          BRANCH: ${{ needs.claude.outputs.branch_name }}
+          ISSUE: ${{ github.event.issue.number }}
+        run: |
+          case "$BRANCH" in
+            claude/issue-*|claude/pr-*) ;;
+            *) echo "分支 $BRANCH 不是 Claude 的 issue 分支，跳过"; exit 0 ;;
+          esac
+          if gh api "repos/$REPO/branches/$BRANCH" --silent 2>/dev/null; then
+            gh workflow run claude-automerge.yml -R "$REPO" --ref "$DEFAULT_BRANCH" -f branch="$BRANCH" -f issue="$ISSUE"
+            echo "已触发 claude-automerge：$BRANCH（issue #$ISSUE）"
+          else
+            echo "分支 $BRANCH 不存在（没改代码，或 Claude 已合并并删除分支），无需兜底"
+          fi
